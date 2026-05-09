@@ -1,0 +1,16 @@
+# Local working notes — handoff docs and reference material that shouldn't ship
+_Working Reference (Ignore)/
+
+# Local Claude Code workspace settings
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
