@@ -179,6 +179,79 @@ function validateHeaders(rows, required, label) {
 }
 
 /* ============================================================
+   CACHE LAYER (IndexedDB) — persist uploaded CSVs across sessions
+   ============================================================
+   Stores parsed CSV rows so users can come back to view the dashboard
+   without re-uploading. Cache writes happen on every successful upload;
+   reads happen once at init() to restore last-known-good state. The
+   restore path re-runs validateHeaders + stitch, so a code change that
+   alters schema requirements falls back gracefully (cache is wiped
+   instead of producing stale results). All data stays on-device. */
+
+const CACHE_DB = 'stitcher-cache';
+const CACHE_STORE = 'csvs';
+const CACHE_VERSION = 1;
+
+function cacheOpenDb() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) return reject(new Error('IndexedDB unavailable'));
+    const req = indexedDB.open(CACHE_DB, CACHE_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(CACHE_STORE)) {
+        db.createObjectStore(CACHE_STORE, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function cachePutCsv(target, fileName, rows) {
+  const db = await cacheOpenDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CACHE_STORE, 'readwrite');
+    tx.objectStore(CACHE_STORE).put({ id: target, fileName, rows, savedAt: Date.now() });
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+async function cacheLoadAll() {
+  const db = await cacheOpenDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CACHE_STORE, 'readonly');
+    const out = {};
+    tx.objectStore(CACHE_STORE).openCursor().onsuccess = (e) => {
+      const cur = e.target.result;
+      if (cur) { out[cur.value.id] = cur.value; cur.continue(); }
+      else resolve(out);
+    };
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function cacheDeleteCsv(target) {
+  const db = await cacheOpenDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CACHE_STORE, 'readwrite');
+    tx.objectStore(CACHE_STORE).delete(target);
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+async function cacheClearAll() {
+  const db = await cacheOpenDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CACHE_STORE, 'readwrite');
+    tx.objectStore(CACHE_STORE).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+/* ============================================================
    5. STITCH
    ============================================================ */
 
@@ -1740,6 +1813,10 @@ function setActiveTab(name) {
   document.querySelectorAll('.tab-content').forEach(el => {
     el.hidden = el.id !== `tab-${name}`;
   });
+  // Tab swaps preserve scroll position by default, which surfaces the wrong
+  // chunk of the new tab when the user clicked from mid-page (e.g. the
+  // "Slice it on the Dashboard" callout near the bottom of Step 2). Reset.
+  window.scrollTo({ top: 0, behavior: 'smooth' });
   if (name === 'dashboard') {
     // The slider + charts were created while the panel was display:none, so
     // their pixel-based layout may be wrong. Force a resize after layout has
@@ -1756,13 +1833,14 @@ function setActiveTab(name) {
   }
 }
 
-function enableDashboardTab() {
+function enableDashboardTab(showCue = true) {
   const link = document.getElementById('tab-link-dashboard');
   // Diff first so a re-stitch in the same session doesn't re-fire the cue.
+  // Cache restores also skip the cue (showCue=false) — it's a quiet welcome-back.
   const wasDisabled = link.classList.contains('disabled');
   link.classList.remove('disabled');
   link.removeAttribute('title');
-  if (wasDisabled) {
+  if (wasDisabled && showCue) {
     link.classList.add('fresh');
     link.addEventListener('click', () => link.classList.remove('fresh'), { once: true });
   }
@@ -1770,7 +1848,7 @@ function enableDashboardTab() {
 
 /* --- Filter UI ---------------------------------------------------------- */
 
-function initDashboard() {
+function initDashboard(opts = {}) {
   cacheParsedDatesOnRows();
   DASH.cmDataset = buildCmDataset();
 
@@ -1896,7 +1974,7 @@ function initDashboard() {
   };
 
   DASH.initialized = true;
-  enableDashboardTab();
+  enableDashboardTab(opts.showCue !== false);
 }
 
 function renderChipGroup(containerId, options, activeSet, onChange) {
@@ -2426,8 +2504,12 @@ function setupDropZone(zoneEl, target, required, label) {
       STATE[target].rows = rows;
       STATE[target].fileName = file.name;
       zoneEl.classList.add('loaded');
+      // A fresh upload supersedes any "restored from last session" badge.
+      zoneEl.classList.remove('from-cache');
       status.innerHTML = `<span class="filename">${escapeHtml(file.name)}</span><br><span class="row-count">${rows.length.toLocaleString()} rows</span> <span class="clear-link" data-clear="${target}">remove</span>`;
       refreshStitchButton();
+      cachePutCsv(target, file.name, rows).catch(e => console.warn('Cache write failed', e));
+      refreshResetButton();
     } catch (err) {
       console.error(err);
       zoneEl.classList.remove('loaded');
@@ -2460,10 +2542,12 @@ function setupDropZone(zoneEl, target, required, label) {
       e.preventDefault();
       STATE[target].rows = null;
       STATE[target].fileName = null;
-      zoneEl.classList.remove('loaded');
+      zoneEl.classList.remove('loaded', 'from-cache');
       status.innerHTML = '';
       input.value = '';
       refreshStitchButton();
+      cacheDeleteCsv(target).catch(e => console.warn('Cache delete failed', e));
+      refreshResetButton();
     }
   });
 }
@@ -2475,7 +2559,7 @@ function rerenderDownstream() {
   renderPreviewTable();
 }
 
-function runStitch() {
+function runStitch(opts = {}) {
   if (!STATE.cm.rows || !STATE.pa.rows) return;
   const t0 = performance.now();
   try {
@@ -2507,22 +2591,139 @@ function runStitch() {
   // The 3 distribution charts (sub-type / parent / course) now live in the Dashboard tab
   // and render on demand via refreshDashboard, so they pick up the active filters.
 
-  // Initialize the Dashboard tab now that we have a stitched dataset
-  try { initDashboard(); }
+  // Initialize the Dashboard tab now that we have a stitched dataset.
+  // Skip the "fresh data" cue on cache restore — it's a quiet welcome-back, not new arrival.
+  try { initDashboard({ showCue: !opts.fromCache }); }
   catch (err) { console.error('Dashboard init failed:', err); }
 
-  // Smooth-scroll to the stats section
-  document.getElementById('step-stats').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  refreshResetButton();
+
+  // Auto-scroll only when the user clicked Stitch — restoring from cache shouldn't yank the page.
+  if (!opts.fromCache) {
+    document.getElementById('step-stats').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
 }
 
-function init() {
+/* --- Cache restore + reset orchestration -------------------------------- */
+
+async function restoreFromCacheIfPresent() {
+  let cached;
+  try { cached = await cacheLoadAll(); }
+  catch (e) { console.warn('IndexedDB unavailable; skipping restore.', e); return; }
+
+  if (!cached.cm || !cached.pa) {
+    refreshResetButton();
+    return;
+  }
+
+  // Re-validate against current schema. If app code has tightened requirements
+  // since the cache was written, wipe rather than restore broken state.
+  try {
+    validateHeaders(cached.cm.rows, REQUIRED_CM_COLS, 'Cached CM CSV');
+    validateHeaders(cached.pa.rows, REQUIRED_PA_COLS, 'Cached PA CSV');
+  } catch (e) {
+    console.warn('Cached files no longer meet schema; clearing.', e);
+    await cacheClearAll().catch(() => {});
+    refreshResetButton();
+    return;
+  }
+
+  STATE.cm.rows     = cached.cm.rows;
+  STATE.cm.fileName = cached.cm.fileName;
+  STATE.pa.rows     = cached.pa.rows;
+  STATE.pa.fileName = cached.pa.fileName;
+  markZoneRestored('cm', cached.cm);
+  markZoneRestored('pa', cached.pa);
+  refreshStitchButton();
+  refreshResetButton();
+
+  // Silently re-stitch so the dashboard is ready the moment the user clicks the tab.
+  runStitch({ fromCache: true });
+}
+
+function markZoneRestored(target, cached) {
+  const zoneEl = document.getElementById('drop-' + target);
+  const status = zoneEl.querySelector('.file-status');
+  zoneEl.classList.add('loaded', 'from-cache');
+  status.innerHTML =
+    `<span class="filename">${escapeHtml(cached.fileName)}</span><br>` +
+    `<span class="row-count">${cached.rows.length.toLocaleString()} rows</span> ` +
+    `<span class="cache-tag">Restored</span> ` +
+    `<span class="clear-link" data-clear="${target}">remove</span>`;
+}
+
+function refreshResetButton() {
+  const btn = document.getElementById('btn-reset');
+  if (!btn) return;
+  const hasData = !!(STATE.cm.rows || STATE.pa.rows || STATE.stitched);
+  btn.hidden = !hasData;
+}
+
+async function resetApp() {
+  const hasData = !!(STATE.cm.rows || STATE.pa.rows || STATE.stitched);
+  if (!hasData) return;
+  if (!confirm('Reset everything? This clears the cached files, the dashboard, and any stitched data on this device. Column preferences and theme tweaks are kept.')) return;
+
+  await cacheClearAll().catch(e => console.warn('Cache clear failed', e));
+
+  // In-memory state
+  STATE.cm.rows = null;     STATE.cm.fileName = null;
+  STATE.pa.rows = null;     STATE.pa.fileName = null;
+  STATE.stitched = null;
+  STATE.unmatched = null;
+  STATE.methodCounts = null;
+  STATE.testRemovedCount = 0;
+  STATE.columns = null;
+
+  // Drop zones
+  for (const target of ['cm', 'pa']) {
+    const zoneEl = document.getElementById('drop-' + target);
+    zoneEl.classList.remove('loaded', 'from-cache', 'dragover');
+    zoneEl.querySelector('.file-status').innerHTML = '';
+    zoneEl.querySelector('input[type="file"]').value = '';
+  }
+
+  // Hide all downstream sections
+  for (const id of ['step-stats', 'step-columns', 'step-preview', 'step-download']) {
+    document.getElementById(id).hidden = true;
+  }
+
+  // Tear down dashboard charts and disable the tab
+  if (DASH.funnelChart)     { try { DASH.funnelChart.destroy(); }     catch(e){} DASH.funnelChart = null; }
+  if (DASH.timeseriesChart) { try { DASH.timeseriesChart.destroy(); } catch(e){} DASH.timeseriesChart = null; }
+  for (const k of Object.keys(PAGE_CHARTS)) {
+    try { PAGE_CHARTS[k].destroy(); } catch(e) {}
+    delete PAGE_CHARTS[k];
+  }
+  DASH.initialized = false;
+  DASH.cmDataset = null;
+  const dashLink = document.getElementById('tab-link-dashboard');
+  dashLink.classList.add('disabled');
+  dashLink.classList.remove('fresh');
+  dashLink.setAttribute('title', 'Upload and stitch reports first');
+
+  if (location.hash === '#dashboard') location.hash = '#configure';
+  else setActiveTab('configure');
+
+  clearError('upload-error');
+
+  refreshStitchButton();
+  refreshResetButton();
+  showToast('Reset complete. Upload your reports to start over.');
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+async function init() {
   // STATE.columns is built after stitch (we need the actual CSV headers to
   // include all source columns, not just the documented defaults).
 
   setupDropZone(document.getElementById('drop-cm'), 'cm', REQUIRED_CM_COLS, 'Campaign Member CSV');
   setupDropZone(document.getElementById('drop-pa'), 'pa', REQUIRED_PA_COLS, 'Participant CSV');
 
-  document.getElementById('btn-stitch').addEventListener('click', runStitch);
+  // Wrap so the click event isn't passed in as the opts arg.
+  document.getElementById('btn-stitch').addEventListener('click', () => runStitch());
+
+  document.getElementById('btn-reset').addEventListener('click', resetApp);
 
   document.getElementById('btn-reset-cols').addEventListener('click', () => {
     const cmHeaders = STATE.cm.rows ? Object.keys(STATE.cm.rows[0]) : [];
@@ -2573,6 +2774,11 @@ function init() {
     setActiveTab((location.hash.replace('#','') || 'configure'));
   });
   setupDrilldownHandlers();
+
+  // Restore cached CSVs before routing so a deep-link to #dashboard lands
+  // correctly when there's a previous session waiting.
+  await restoreFromCacheIfPresent();
+
   setActiveTab(location.hash.replace('#','') || 'configure');
 }
 

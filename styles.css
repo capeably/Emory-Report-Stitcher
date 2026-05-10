@@ -538,6 +538,25 @@ button.secondary {
 }
 .clear-link:hover { color: #a3322b; }
 
+/* "Restored from cache" chip — appears next to the row count after auto-restore */
+.cache-tag {
+  display: inline-block;
+  margin-left: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--amber);
+  background: var(--amber-tint);
+  border: 1px solid var(--amber-tint-2);
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  vertical-align: middle;
+}
+
+/* Reset button hugs the right edge of Step 1's action-row when visible */
+#btn-reset { margin-left: auto; }
+
 @media (max-width: 760px) {
   .drop-grid { grid-template-columns: 1fr; }
 }
