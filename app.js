@@ -684,6 +684,10 @@ function buildHorizontalStackedConfig(labels, regSeries, enrSeries, opts = {}) {
         y: {
           stacked: true,
           ticks: {
+            // Force every label to render. Without this, Chart.js auto-skips
+            // labels it thinks are crowded — which clipped the longer course
+            // names on the in-page charts.
+            autoSkip: false,
             font: { size: fontSize, family: 'Arial' },
             color: '#000',
             // Wrap long category labels across two lines so they don't clip on the
@@ -712,8 +716,19 @@ function buildHorizontalStackedConfig(labels, regSeries, enrSeries, opts = {}) {
           },
         },
         // Per R1 Feedback: only show TOTAL value at the right (outer) edge of each bar.
-        tooltip: { enabled: !isPng },
+        // yAlign: 'bottom' anchors the tooltip's arrow at the bottom of the box,
+        // which puts the body ABOVE the cursor — so it isn't hidden under the
+        // user's finger/pointer on touch + small-screen setups.
+        tooltip: { enabled: !isPng, yAlign: 'bottom', caretPadding: 8 },
       },
+      onClick: (!isPng && opts.onClick) ? (evt, elements) => {
+        if (elements.length) opts.onClick(elements[0].index, elements[0].datasetIndex);
+      } : undefined,
+      onHover: (!isPng && opts.onClick) ? (evt, elements) => {
+        if (evt.native && evt.native.target) {
+          evt.native.target.style.cursor = elements.length ? 'pointer' : 'default';
+        }
+      } : undefined,
     },
     plugins: [totalsLabelPlugin(totalsSize)],
   };
@@ -747,7 +762,7 @@ function destroyChart(map, key) {
   if (map[key]) { try { map[key].destroy(); } catch(e) {} delete map[key]; }
 }
 
-function renderInPageCharts(agg) {
+function renderInPageCharts(agg, filteredCmSet) {
   // Sub-type chart: detail rows only (NO bucket parents — matches stitch.py chart source).
   const sLabels = [], sReg = [], sEnr = [];
   for (const bkt of Object.keys(agg.subtypeBuckets)) {
@@ -760,7 +775,11 @@ function renderInPageCharts(agg) {
   destroyChart(PAGE_CHARTS, 'subtype');
   const subCanvas = document.getElementById('chart-subtype');
   subCanvas.parentElement.style.height = Math.max(220, sLabels.length * 38 + 80) + 'px';
-  PAGE_CHARTS.subtype = new Chart(subCanvas, buildHorizontalStackedConfig(sLabels, sReg, sEnr));
+  PAGE_CHARTS.subtype = new Chart(subCanvas, buildHorizontalStackedConfig(sLabels, sReg, sEnr, {
+    onClick: filteredCmSet ? (idx, statusIdx) => openDistributionDrilldown(
+      'subType', sLabels[idx], statusIdx === 0 ? 'Registered' : 'Enrolled', filteredCmSet
+    ) : undefined,
+  }));
 
   destroyChart(PAGE_CHARTS, 'parent');
   const pLabels = agg.parent.map(r => r.name);
@@ -768,15 +787,25 @@ function renderInPageCharts(agg) {
   const pEnr = agg.parent.map(r => r.enr);
   const pCanvas = document.getElementById('chart-parent');
   pCanvas.parentElement.style.height = Math.max(260, pLabels.length * 30 + 80) + 'px';
-  PAGE_CHARTS.parent = new Chart(pCanvas, buildHorizontalStackedConfig(pLabels, pReg, pEnr));
+  PAGE_CHARTS.parent = new Chart(pCanvas, buildHorizontalStackedConfig(pLabels, pReg, pEnr, {
+    onClick: filteredCmSet ? (idx, statusIdx) => openDistributionDrilldown(
+      'parentCampaign', pLabels[idx], statusIdx === 0 ? 'Registered' : 'Enrolled', filteredCmSet
+    ) : undefined,
+  }));
 
   destroyChart(PAGE_CHARTS, 'course');
   const cLabels = agg.course.map(r => r.name);
   const cReg = agg.course.map(r => r.reg);
   const cEnr = agg.course.map(r => r.enr);
   const cCanvas = document.getElementById('chart-course');
-  cCanvas.parentElement.style.height = Math.max(280, cLabels.length * 28 + 80) + 'px';
-  PAGE_CHARTS.course = new Chart(cCanvas, buildHorizontalStackedConfig(cLabels, cReg, cEnr));
+  // Bumped from 28 → 44 per row so wrapped course names (e.g. "Advanced Executive
+  // Coaching Certificate Program") have room without Chart.js auto-skipping labels.
+  cCanvas.parentElement.style.height = Math.max(280, cLabels.length * 44 + 90) + 'px';
+  PAGE_CHARTS.course = new Chart(cCanvas, buildHorizontalStackedConfig(cLabels, cReg, cEnr, {
+    onClick: filteredCmSet ? (idx, statusIdx) => openDistributionDrilldown(
+      'course', cLabels[idx], statusIdx === 0 ? 'Registered' : 'Enrolled', filteredCmSet
+    ) : undefined,
+  }));
 }
 
 async function renderOffscreenChartPng(canvasId, labels, reg, enr) {
@@ -1619,7 +1648,7 @@ async function embedChartPngs(wb, summaryWs, ctx) {
    15. xlsx — TOP-LEVEL BUILD + DOWNLOAD
    ============================================================ */
 
-async function generateXlsx() {
+async function generateXlsx(opts = {}) {
   const wb = new ExcelJS.Workbook();
   wb.creator = 'Report Stitcher';
   wb.created = new Date();
@@ -1633,7 +1662,38 @@ async function generateXlsx() {
   const buf = await wb.xlsx.writeBuffer();
   const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
   const stamp = new Date().toISOString().slice(0, 10);
-  saveAs(blob, `Stitched_Report_${stamp}.xlsx`);
+  const suffix = opts.filenameSuffix || '';
+  saveAs(blob, `Stitched_Report${suffix}_${stamp}.xlsx`);
+}
+
+/* Generate an xlsx from the dashboard's current filter cohort. We temporarily
+   swap STATE.stitched and STATE.cm.rows to the filtered subsets so the existing
+   sheet builders work unchanged, then restore. The filtered CM cohort drives
+   both: stitched rows are kept only if their CM is in the cohort, and
+   STATE.cm.rows is narrowed to just those CMs (so the Campaign Members data
+   sheet and Campaign Summary pivots only count this subset). */
+async function generateFilteredXlsx() {
+  if (!DASH.initialized || !DASH.cmDataset) {
+    throw new Error('Dashboard is not initialized.');
+  }
+  const filtered = applyDashboardFilters(DASH.cmDataset);
+  if (filtered.length === 0) {
+    throw new Error('No Campaign Members match the current filter.');
+  }
+  const filteredCmSet    = new Set(filtered.map(d => d.cm));
+  const filteredStitched = STATE.stitched.filter(s => filteredCmSet.has(s.cm));
+  const filteredCmRows   = STATE.cm.rows.filter(cm => filteredCmSet.has(cm));
+
+  const origStitched = STATE.stitched;
+  const origCmRows   = STATE.cm.rows;
+  STATE.stitched = filteredStitched;
+  STATE.cm.rows  = filteredCmRows;
+  try {
+    await generateXlsx({ filenameSuffix: '_filtered' });
+  } finally {
+    STATE.stitched = origStitched;
+    STATE.cm.rows  = origCmRows;
+  }
 }
 
 /* ============================================================
@@ -1667,21 +1727,24 @@ const FILTERS = {
   dateMax: null,
   dateMode: 'activity',    // 'activity' | 'courseStart'
   parentCampaigns: null,   // null = all, else Set<string>
-  subTypeBuckets: null,    // null = all (= empty selection), else Set<string>
-  courseStatuses: null,    // null = all, else Set<string>
+  subTypes:        null,   // null = all, else Set<string>  (raw Sub-Type values)
+  subTypeBuckets:  null,   // null = all (= empty selection), else Set<string>
+  courseStatuses:  null,   // null = all, else Set<string>
 };
 const DASH = {
-  initialized:    false,
-  cmDataset:      null,    // [{ cm, pa, courseStatus, parentCampaign, ... }]
-  parentList:     [],
-  parentSelected: null,    // Set<string>
-  dateMinAvail:   null,    // Date
-  dateMaxAvail:   null,
-  funnelChart:    null,
-  timeseriesChart:null,
-  drillRows:      [],
-  drillPage:      0,
-  drillPageSize:  12,
+  initialized:     false,
+  cmDataset:       null,   // [{ cm, pa, courseStatus, parentCampaign, ... }]
+  parentList:      [],
+  parentSelected:  null,   // Set<string>
+  subTypeList:     [],
+  subTypeSelected: null,   // Set<string>
+  dateMinAvail:    null,   // Date
+  dateMaxAvail:    null,
+  funnelChart:     null,
+  timeseriesChart: null,
+  drillRows:       [],
+  drillPage:       0,
+  drillPageSize:   12,
 };
 
 /* --- Date helpers -------------------------------------------------------- */
@@ -1775,6 +1838,7 @@ function buildCmDataset() {
       courseStatus,
       parentCampaign: (cm['Parent Campaign Name'] || '').trim() || '(blank)',
       campaignName:   (cm['Campaign Name']        || '').trim() || '(blank)',
+      subType:        (cm['Sub-Type']             || '').trim() || '(blank)',
       subTypeBucket:  bucket(cm['Sub-Type']),
       cmUpdate:       cm._memberStatusUpdate,
       paCreated:      best ? best.pa._paCreated   : null,
@@ -1784,7 +1848,7 @@ function buildCmDataset() {
 }
 
 function applyDashboardFilters(dataset) {
-  const { dateMin, dateMax, dateMode, parentCampaigns, subTypeBuckets, courseStatuses } = FILTERS;
+  const { dateMin, dateMax, dateMode, parentCampaigns, subTypes, subTypeBuckets, courseStatuses } = FILTERS;
   return dataset.filter(d => {
     const dateVal = dateMode === 'courseStart' ? d.courseStart : d.cmUpdate;
     // Rows lacking a date in the active mode are excluded when a range is set —
@@ -1793,6 +1857,7 @@ function applyDashboardFilters(dataset) {
     if (dateMin && dateVal < dateMin) return false;
     if (dateMax && dateVal > new Date(dateMax.getTime() + ONE_DAY - 1)) return false;
     if (parentCampaigns && !parentCampaigns.has(d.parentCampaign)) return false;
+    if (subTypes        && !subTypes.has(d.subType)) return false;
     if (subTypeBuckets  && !subTypeBuckets.has(d.subTypeBucket)) return false;
     if (courseStatuses  && !courseStatuses.has(d.courseStatus)) return false;
     return true;
@@ -1932,6 +1997,11 @@ function initDashboard(opts = {}) {
   DASH.parentSelected = new Set(DASH.parentList);
   renderParentMultiselect();
 
+  // Sub-Type multi-select (raw Sub-Type values, more granular than the bucket chips)
+  DASH.subTypeList = [...new Set(DASH.cmDataset.map(d => d.subType))].sort((a,b) => a.localeCompare(b));
+  DASH.subTypeSelected = new Set(DASH.subTypeList);
+  renderSubTypeMultiselect();
+
   // Sub-Type Bucket chips
   renderChipGroup('filter-bucket-chips', BUCKET_OPTIONS, FILTERS.subTypeBuckets, (set) => {
     FILTERS.subTypeBuckets = set.size === 0 ? null : set;
@@ -1954,11 +2024,13 @@ function initDashboard(opts = {}) {
 
   // Reset filters
   document.getElementById('btn-filter-reset').onclick = () => {
-    FILTERS.subTypeBuckets = new Set(BUCKET_OPTIONS);
-    FILTERS.courseStatuses = new Set(['Cancelled/Withdrawn/Etc', 'Registered', 'Enrolled']);
+    FILTERS.subTypeBuckets  = new Set(BUCKET_OPTIONS);
+    FILTERS.courseStatuses  = new Set(['Cancelled/Withdrawn/Etc', 'Registered', 'Enrolled']);
     FILTERS.parentCampaigns = null;
-    FILTERS.dateMode = 'activity';
-    DASH.parentSelected = new Set(DASH.parentList);
+    FILTERS.subTypes        = null;
+    FILTERS.dateMode        = 'activity';
+    DASH.parentSelected  = new Set(DASH.parentList);
+    DASH.subTypeSelected = new Set(DASH.subTypeList);
     sliderEl.noUiSlider.set([DASH.dateMinAvail.getTime(), DASH.dateMaxAvail.getTime()]);
     document.getElementById('filter-date-label').textContent = 'Activity';
     renderChipGroup('filter-bucket-chips', BUCKET_OPTIONS, FILTERS.subTypeBuckets, (set) => {
@@ -1970,6 +2042,7 @@ function initDashboard(opts = {}) {
       refreshDashboard();
     });
     renderParentMultiselect();
+    renderSubTypeMultiselect();
     refreshDashboard();
   };
 
@@ -1996,48 +2069,57 @@ function renderChipGroup(containerId, options, activeSet, onChange) {
   }
 }
 
-function renderParentMultiselect() {
-  const toggle   = document.getElementById('filter-parent-toggle');
-  const dropdown = document.getElementById('filter-parent-dropdown');
+/* Generic multi-select dropdown — one instance per filter (Parent, Sub-Type).
+   Caller supplies the DOM ids, the list/selected state accessors, an onCommit
+   callback (typically updates FILTERS + refreshes the dashboard), and label
+   nouns. Behavior: search field, "select all visible" checkbox, individual
+   row checkboxes, outside-click closes the dropdown. */
+function renderMultiselect(opts) {
+  const toggle   = document.getElementById(opts.toggleId);
+  const dropdown = document.getElementById(opts.dropdownId);
 
   function updateLabel() {
-    const total = DASH.parentList.length;
-    const sel = DASH.parentSelected.size;
-    if (sel === total)      toggle.innerHTML = `All campaigns (${total}) &#x25BE;`;
-    else if (sel === 0)     toggle.innerHTML = `No campaigns selected &#x25BE;`;
-    else if (sel === 1)     toggle.innerHTML = `${escapeHtml([...DASH.parentSelected][0]).slice(0, 32)} &#x25BE;`;
-    else                    toggle.innerHTML = `${sel} of ${total} campaigns &#x25BE;`;
+    const list = opts.listGetter();
+    const sel  = opts.selectedGetter();
+    const total = list.length;
+    const n = sel.size;
+    const arrow = '&#x25BE;';
+    if (n === total)      toggle.innerHTML = `All ${opts.nounPlural} (${total}) ${arrow}`;
+    else if (n === 0)     toggle.innerHTML = `No ${opts.nounPlural} selected ${arrow}`;
+    else if (n === 1)     toggle.innerHTML = `${escapeHtml([...sel][0]).slice(0, 32)} ${arrow}`;
+    else                  toggle.innerHTML = `${n} of ${total} ${opts.nounPlural} ${arrow}`;
   }
 
   function rebuild(filterText) {
+    const list = opts.listGetter();
+    const sel  = opts.selectedGetter();
     dropdown.innerHTML = '';
     const search = document.createElement('input');
     search.className   = 'filter-multi-search';
-    search.placeholder = 'Search…';
+    search.placeholder = opts.searchPlaceholder || 'Search…';
     search.value       = filterText || '';
     search.addEventListener('input', e => rebuild(e.target.value));
     dropdown.appendChild(search);
     setTimeout(() => search.focus(), 0);
 
     const ft = (filterText || '').toLowerCase();
-    const visible = DASH.parentList.filter(p => !ft || p.toLowerCase().includes(ft));
+    const visible = list.filter(p => !ft || p.toLowerCase().includes(ft));
 
     const allRow = document.createElement('label');
     allRow.className = 'filter-multi-option all-row';
     const allCb = document.createElement('input');
     allCb.type  = 'checkbox';
-    allCb.checked = visible.length > 0 && visible.every(p => DASH.parentSelected.has(p));
-    allCb.indeterminate = !allCb.checked && visible.some(p => DASH.parentSelected.has(p));
+    allCb.checked = visible.length > 0 && visible.every(p => sel.has(p));
+    allCb.indeterminate = !allCb.checked && visible.some(p => sel.has(p));
     allCb.addEventListener('change', () => {
-      if (allCb.checked) for (const p of visible) DASH.parentSelected.add(p);
-      else               for (const p of visible) DASH.parentSelected.delete(p);
+      if (allCb.checked) for (const p of visible) sel.add(p);
+      else               for (const p of visible) sel.delete(p);
       rebuild(filterText);
       updateLabel();
-      FILTERS.parentCampaigns = DASH.parentSelected.size === DASH.parentList.length ? null : DASH.parentSelected;
-      refreshDashboard();
+      opts.onCommit();
     });
     const allLbl = document.createElement('span');
-    allLbl.textContent = ft ? `Select all visible (${visible.length})` : `Select all (${DASH.parentList.length})`;
+    allLbl.textContent = ft ? `Select all visible (${visible.length})` : `Select all (${list.length})`;
     allRow.appendChild(allCb);
     allRow.appendChild(allLbl);
     dropdown.appendChild(allRow);
@@ -2047,13 +2129,12 @@ function renderParentMultiselect() {
       row.className = 'filter-multi-option';
       const cb = document.createElement('input');
       cb.type    = 'checkbox';
-      cb.checked = DASH.parentSelected.has(p);
+      cb.checked = sel.has(p);
       cb.addEventListener('change', () => {
-        if (cb.checked) DASH.parentSelected.add(p);
-        else            DASH.parentSelected.delete(p);
+        if (cb.checked) sel.add(p);
+        else            sel.delete(p);
         updateLabel();
-        FILTERS.parentCampaigns = DASH.parentSelected.size === DASH.parentList.length ? null : DASH.parentSelected;
-        refreshDashboard();
+        opts.onCommit();
       });
       const lbl = document.createElement('span');
       lbl.textContent = p;
@@ -2063,22 +2144,54 @@ function renderParentMultiselect() {
     }
   }
 
-  toggle.onclick = (e) => {
-    e.stopPropagation();
+  toggle.onclick = () => {
+    // Intentionally NOT stopping propagation: lets sibling multi-selects'
+    // outside-click handlers close themselves when this one opens, so only
+    // one dropdown is open at a time.
     if (dropdown.hidden) { rebuild(''); dropdown.hidden = false; }
     else                 { dropdown.hidden = true; }
   };
-  // Single document-level handler — register only once
-  if (!renderParentMultiselect._docHandlerInstalled) {
+  // Outside-click closes — installed once per toggle so multiple multi-selects coexist.
+  if (!toggle._docHandlerInstalled) {
     document.addEventListener('click', (e) => {
       if (!dropdown.contains(e.target) && e.target !== toggle && !toggle.contains(e.target)) {
         dropdown.hidden = true;
       }
     });
-    renderParentMultiselect._docHandlerInstalled = true;
+    toggle._docHandlerInstalled = true;
   }
 
   updateLabel();
+}
+
+function renderParentMultiselect() {
+  renderMultiselect({
+    toggleId:    'filter-parent-toggle',
+    dropdownId:  'filter-parent-dropdown',
+    listGetter:    () => DASH.parentList,
+    selectedGetter:() => DASH.parentSelected,
+    onCommit: () => {
+      FILTERS.parentCampaigns = DASH.parentSelected.size === DASH.parentList.length ? null : DASH.parentSelected;
+      refreshDashboard();
+    },
+    nounPlural: 'campaigns',
+    searchPlaceholder: 'Search campaigns…',
+  });
+}
+
+function renderSubTypeMultiselect() {
+  renderMultiselect({
+    toggleId:    'filter-subtype-toggle',
+    dropdownId:  'filter-subtype-dropdown',
+    listGetter:    () => DASH.subTypeList,
+    selectedGetter:() => DASH.subTypeSelected,
+    onCommit: () => {
+      FILTERS.subTypes = DASH.subTypeSelected.size === DASH.subTypeList.length ? null : DASH.subTypeSelected;
+      refreshDashboard();
+    },
+    nounPlural: 'sub-types',
+    searchPlaceholder: 'Search sub-types…',
+  });
 }
 
 /* --- Refresh orchestration --------------------------------------------- */
@@ -2092,9 +2205,11 @@ function refreshDashboard() {
   // Distribution charts: feed the subset of stitched rows whose CM passed the
   // dashboard filter. aggregateAll only counts Registered + Enrolled so the
   // status chips don't matter to these charts — date/parent/bucket filters do.
+  // filteredCmSet is also forwarded so the click-to-drill handlers can scope
+  // the drilldown to the same cohort the bars are showing.
   const filteredCmSet = new Set(filtered.map(d => d.cm));
   const filteredStitched = STATE.stitched.filter(s => filteredCmSet.has(s.cm));
-  renderInPageCharts(aggregateAll(filteredStitched));
+  renderInPageCharts(aggregateAll(filteredStitched), filteredCmSet);
   renderCampaignSummaryTable(filtered);
   renderFilterSummary(filtered, DASH.cmDataset);
 }
@@ -2182,6 +2297,10 @@ function renderFilterSummary(filtered, all) {
   summary.innerHTML =
     `Showing <strong>${filtered.length.toLocaleString()}</strong> of ${all.length.toLocaleString()} Campaign Members ` +
     `(${fmtDate(FILTERS.dateMin)} – ${fmtDate(FILTERS.dateMax)} on ${dateLbl})`;
+
+  // Filtered xlsx export needs at least one row to be meaningful.
+  const xlsxBtn = document.getElementById('btn-filtered-xlsx');
+  if (xlsxBtn) xlsxBtn.disabled = filtered.length === 0;
 }
 
 function renderDashKpis(filtered) {
@@ -2408,6 +2527,41 @@ function openDrilldown(title, cmRows) {
     `match the current filter and selection.`;
   renderDrilldownPage();
   document.getElementById('drilldown-dialog').showModal();
+}
+
+/* Click-to-drill from the three distribution charts (sub-type / parent / course).
+   Each click identifies a (dimension, status) pair. We pull stitched rows where
+   the PA status matches AND the dimension matches AND the CM is in the dashboard's
+   filtered cohort, then reshape each stitched row into the row shape the
+   drilldown table expects. Showing stitched rows (not deduped CMs) means the
+   drilldown count matches the bar segment count the user clicked. */
+function openDistributionDrilldown(dimension, dimensionValue, status, filteredCmSet) {
+  const matchesDimension = (s) => {
+    if (dimension === 'course')         return (s.pa['Course Name']           || '').trim() === dimensionValue;
+    if (dimension === 'parentCampaign') return ((s.cm['Parent Campaign Name'] || '').trim() || '(blank)') === dimensionValue;
+    if (dimension === 'subType')        return ((s.cm['Sub-Type']             || '').trim() || '(blank)') === dimensionValue;
+    return false;
+  };
+  const matching = STATE.stitched
+    .filter(s => filteredCmSet.has(s.cm)
+              && (s.pa['Status'] || '').trim() === status
+              && matchesDimension(s))
+    .map(s => ({
+      cm: s.cm,
+      pa: s.pa,
+      bestMatch:      s,
+      courseStatus:   (s.pa['Status'] || '').trim(),
+      parentCampaign: (s.cm['Parent Campaign Name'] || '').trim() || '(blank)',
+      campaignName:   (s.cm['Campaign Name']        || '').trim() || '(blank)',
+      subType:        (s.cm['Sub-Type']             || '').trim() || '(blank)',
+      subTypeBucket:  s.subtypeBucket,
+      cmUpdate:       s.cm._memberStatusUpdate,
+      paCreated:      s.pa._paCreated,
+      courseStart:    s.pa._courseStart,
+    }));
+
+  const noun = matching.length === 1 ? 'record' : 'records';
+  openDrilldown(`${dimensionValue} — ${status} — ${matching.length.toLocaleString()} ${noun}`, matching);
 }
 
 function renderDrilldownPage() {
@@ -2760,6 +2914,26 @@ async function init() {
       status.textContent = '';
       showToast('xlsx generation failed: ' + err.message, true);
     } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // Dashboard: Generate xlsx from the current filter cohort
+  document.getElementById('btn-filtered-xlsx').addEventListener('click', async () => {
+    const btn = document.getElementById('btn-filtered-xlsx');
+    const status = document.getElementById('filtered-xlsx-status');
+    btn.disabled = true;
+    status.innerHTML = '<span class="spinner" style="border-color:rgba(31,56,100,.2);border-top-color:#1F3864;"></span>Building filtered xlsx…';
+    try {
+      await generateFilteredXlsx();
+      status.textContent = 'Done.';
+      setTimeout(() => { status.textContent = ''; }, 2500);
+    } catch (err) {
+      console.error(err);
+      status.textContent = '';
+      showToast('Filtered xlsx failed: ' + err.message, true);
+    } finally {
+      // refreshFilterSummary on the next refresh will re-disable if needed.
       btn.disabled = false;
     }
   });

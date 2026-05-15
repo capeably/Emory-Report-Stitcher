@@ -1113,14 +1113,35 @@ footer .privacy-note { color: var(--text); font-weight: 500; }
 .chip.status-registered.active   { background: var(--status-registered);   border-color: var(--status-registered);   color: #fff; }
 .chip.status-enrolled.active     { background: var(--status-enrolled);     border-color: var(--status-enrolled);     color: #fff; }
 
-.filter-summary {
+/* Bottom row of the filter-bar: "Showing X of Y" caption on the left,
+   the filtered-xlsx CTA on the right. Wraps on narrow viewports. */
+.filter-summary-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
   margin-top: 14px;
   padding-top: 14px;
   border-top: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+.filter-summary {
+  font-size: 13px;
+  color: var(--text-muted);
+  flex: 1 1 240px;
+  min-width: 0;
+}
+.filter-summary strong { color: var(--text); font-weight: 600; }
+.filter-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.filter-actions #filtered-xlsx-status {
   font-size: 13px;
   color: var(--text-muted);
 }
-.filter-summary strong { color: var(--text); font-weight: 600; }
 
 /* ============================================================
    Dashboard — chart cards

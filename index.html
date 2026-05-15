@@ -200,6 +200,11 @@
           <button id="filter-parent-toggle" class="filter-multi-toggle" type="button">All campaigns ▾</button>
           <div id="filter-parent-dropdown" class="filter-multi-dropdown" hidden></div>
         </div>
+        <div class="filter-multi">
+          <label>Sub-Type</label>
+          <button id="filter-subtype-toggle" class="filter-multi-toggle" type="button">All sub-types ▾</button>
+          <div id="filter-subtype-dropdown" class="filter-multi-dropdown" hidden></div>
+        </div>
         <div class="filter-chips">
           <label>Sub-Type Bucket</label>
           <div class="chip-group" id="filter-bucket-chips"></div>
@@ -210,7 +215,13 @@
         </div>
         <button class="secondary" id="btn-filter-reset" type="button">Reset filters</button>
       </div>
-      <div class="filter-summary" id="filter-summary"></div>
+      <div class="filter-summary-row">
+        <div class="filter-summary" id="filter-summary"></div>
+        <div class="filter-actions">
+          <button class="primary-amber" id="btn-filtered-xlsx" type="button" disabled>Generate xlsx (current filter)</button>
+          <span id="filtered-xlsx-status"></span>
+        </div>
+      </div>
     </section>
 
     <p class="kpi-section-label">Filtered Campaign Member funnel</p>
